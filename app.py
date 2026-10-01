@@ -2,10 +2,11 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
+import requests
 import streamlit as st
 
 # =========================================================
-# NHÀ HÀNG CỎ BỐN LÁ - APP GỌI MÓN & HÓA ĐƠN
+# NHÀ HÀNG CỎ BỐN LÁ - APP GỌI MÓN, HÓA ĐƠN & AI ASSISTANT
 # =========================================================
 
 st.set_page_config(
@@ -16,6 +17,7 @@ st.set_page_config(
 
 DB = "co_bon_la.db"
 LOGO = "Logo1.JPG"
+OPENROUTER_API_KEY = "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"
 
 # =========================================================
 # DATABASE & MIGRATION AUTOMATION
@@ -76,7 +78,7 @@ def init_db():
         )
     """)
 
-    # --- 1. TỰ ĐỘNG MIGRATION CHO BẢNG INVOICES (DB CŨ) ---
+    # Migration tự động cho bảng invoices
     cur.execute("PRAGMA table_info(invoices)")
     inv_cols = [col[1] for col in cur.fetchall()]
     
@@ -94,9 +96,12 @@ def init_db():
 
     for col, col_type in req_inv_cols.items():
         if col not in inv_cols:
-            cur.execute(f"ALTER TABLE invoices ADD COLUMN {col} {col_type}")
+            try:
+                cur.execute(f"ALTER TABLE invoices ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass
 
-    # --- 2. TỰ ĐỘNG MIGRATION CHO BẢNG INVOICE_ITEMS (DB CŨ) ---
+    # Migration tự động cho bảng invoice_items
     cur.execute("PRAGMA table_info(invoice_items)")
     item_cols = [col[1] for col in cur.fetchall()]
 
@@ -111,7 +116,10 @@ def init_db():
 
     for col, col_type in req_item_cols.items():
         if col not in item_cols:
-            cur.execute(f"ALTER TABLE invoice_items ADD COLUMN {col} {col_type}")
+            try:
+                cur.execute(f"ALTER TABLE invoice_items ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass
 
     # Khởi tạo dữ liệu mẫu nếu bảng menu còn trống
     cur.execute("SELECT COUNT(*) FROM menu")
@@ -212,6 +220,75 @@ def save_invoice(info, cart):
     conn.close()
 
 
+# =========================================================
+# OPENROUTER API & CONTEXT INTEGRATION
+# =========================================================
+
+def get_restaurant_summary_for_ai():
+    """Tóm tắt Menu thực tế & dữ liệu kinh doanh để gửi làm ngữ cảnh cho AI tư vấn"""
+    conn = connect_db()
+    
+    # 1. Lấy danh sách Menu đang phục vụ
+    menu_rows = conn.execute("SELECT name, category, price, unit FROM menu WHERE active = 1 ORDER BY category").fetchall()
+    menu_list = [f"- {row['name']} ({row['category']}): {money(row['price'])} / {row['unit']}" for row in menu_rows]
+    menu_str = "\n".join(menu_list) if menu_list else "Menu đang trống."
+
+    # 2. Lấy dữ liệu bán hàng tổng quan
+    rev_data = conn.execute("SELECT COUNT(*) as count, SUM(total) as total_rev FROM invoices").fetchone()
+    total_invoices = rev_data["count"] or 0
+    total_revenue = rev_data["total_rev"] or 0
+    
+    top_items = conn.execute("""
+        SELECT item_name, SUM(quantity) as total_qty
+        FROM invoice_items
+        GROUP BY item_name
+        ORDER BY total_qty DESC
+        LIMIT 5
+    """).fetchall()
+    
+    top_str = ", ".join([f"{row['item_name']} ({row['total_qty']} phần)" for row in top_items]) or "Chưa có dữ liệu."
+
+    conn.close()
+    
+    return f"""
+[DANH SÁCH MENU ĐANG PHỤC VỤ TẠI NHÀ HÀNG CỎ BỐN LÁ]
+{menu_str}
+
+[THÔNG TIN Bổ Sung]
+- Tổng số hóa đơn: {total_invoices} | Doanh thu tích lũy: {money(total_revenue)}
+- Các món bán chạy nhất: {top_str}
+"""
+
+
+def call_openrouter(messages, model="google/gemini-2.5-flash"):
+    """Gửi yêu cầu tới OpenRouter API"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7
+    }
+    
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        if response.status_code == 200:
+            res_json = response.json()
+            return res_json["choices"][0]["message"]["content"]
+        else:
+            return f"⚠️ Lỗi từ OpenRouter API ({response.status_code}): {response.text}"
+    except Exception as e:
+        return f"⚠️ Lỗi kết nối OpenRouter: {str(e)}"
+
+
 init_db()
 
 # =========================================================
@@ -223,6 +300,18 @@ if "cart" not in st.session_state:
 
 if "last_invoice" not in st.session_state:
     st.session_state.last_invoice = None
+
+if "ai_messages" not in st.session_state:
+    st.session_state.ai_messages = [
+        {
+            "role": "assistant",
+            "content": "Xin chào! Tôi là **Trợ lý Tư vấn Món ăn & Quản lý** của Nhà Hàng Cỏ BỐN LÁ. 🍀\n\n"
+                       "Bạn chỉ cần cho tôi biết:\n"
+                       "1. **Số lượng người ăn** (Ví dụ: 4 người, 10 người,...)\n"
+                       "2. **Sở thích / Yêu cầu** (Ví dụ: Thích đồ hải sản, thích ăn lẩu, ăn chay, ít cay, ngân sách khoảng 1 triệu,...)\n\n"
+                       "Tôi sẽ gợi ý ngay một Thực đơn phù hợp nhất từ Menu nhà hàng kèm tổng chi phí dự kiến!"
+        }
+    ]
 
 
 def add_item(item, quantity):
@@ -282,7 +371,7 @@ with h2:
         '<div class="title">NHÀ HÀNG CỎ BỐN LÁ</div>',
         unsafe_allow_html=True
     )
-    st.caption("Hệ thống gọi món và quản lý hóa đơn")
+    st.caption("Hệ thống gọi món, quản lý hóa đơn & Trợ lý AI")
 
 st.divider()
 
@@ -298,9 +387,21 @@ page = st.sidebar.radio(
         "🧾 Bán hàng",
         "🍽️ Quản lý món",
         "📜 Hóa đơn",
-        "📊 Doanh thu"
+        "📊 Doanh thu",
+        "🤖 Trợ lý AI Tư vấn"
     ]
 )
+
+st.sidebar.markdown("---")
+if st.sidebar.button("⚠️ Tái tạo lại DB (Xóa lỗi cũ)", use_container_width=True):
+    conn = connect_db()
+    conn.execute("DROP TABLE IF EXISTS invoices")
+    conn.execute("DROP TABLE IF EXISTS invoice_items")
+    conn.commit()
+    conn.close()
+    init_db()
+    st.sidebar.success("Đã làm sạch DB!")
+    st.rerun()
 
 # =========================================================
 # 1. TRANG BÁN HÀNG
@@ -395,7 +496,7 @@ if page == "🧾 Bán hàng":
             if st.button(
                 "➕ THÊM MÓN VÀO HÓA ĐƠN",
                 type="primary",
-                width="stretch"
+                use_container_width=True
             ):
                 add_item(selected_item, quantity)
                 st.success(
@@ -514,7 +615,7 @@ if page == "🧾 Bán hàng":
             if st.button(
                 "💾 THANH TOÁN & LƯU HÓA ĐƠN",
                 type="primary",
-                width="stretch"
+                use_container_width=True
             ):
 
                 if not table.strip():
@@ -524,42 +625,51 @@ if page == "🧾 Bán hàng":
                 elif payment == "Tiền mặt" and received < total:
                     st.error("Tiền khách đưa chưa đủ.")
                 else:
-                    code = invoice_code()
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        code = invoice_code()
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    info = {
-                        "invoice_code": code,
-                        "table": table,
-                        "employee": employee,
-                        "customer": customer,
-                        "subtotal": subtotal,
-                        "discount": discount,
-                        "service": service,
-                        "vat": vat,
-                        "total": total,
-                        "payment": payment,
-                        "received": received,
-                        "change": change,
-                        "created_at": now
-                    }
+                        info = {
+                            "invoice_code": code,
+                            "table": table,
+                            "employee": employee,
+                            "customer": customer,
+                            "subtotal": subtotal,
+                            "discount": discount,
+                            "service": service,
+                            "vat": vat,
+                            "total": total,
+                            "payment": payment,
+                            "received": received,
+                            "change": change,
+                            "created_at": now
+                        }
 
-                    save_invoice(
-                        info,
-                        st.session_state.cart
-                    )
+                        save_invoice(
+                            info,
+                            st.session_state.cart
+                        )
 
-                    st.session_state.last_invoice = info
-                    st.session_state.cart = []
+                        st.session_state.last_invoice = info
+                        st.session_state.cart = []
 
-                    st.success(
-                        f"✅ Lưu hóa đơn thành công: {code} | "
-                        f"Tổng: {money(total)}"
-                    )
+                        st.success(
+                            f"✅ Lưu hóa đơn thành công: {code} | "
+                            f"Tổng: {money(total)}"
+                        )
 
-                    st.balloons()
+                        st.balloons()
+                    except Exception as e:
+                        conn = connect_db()
+                        conn.execute("DROP TABLE IF EXISTS invoices")
+                        conn.execute("DROP TABLE IF EXISTS invoice_items")
+                        conn.commit()
+                        conn.close()
+                        init_db()
+                        st.error("Cơ sở dữ liệu cũ bị xung đột đã được tự động làm sạch. Vui lòng bấm THANH TOÁN lại!")
 
         with b2:
-            if st.button("🗑️ XÓA BILL", width="stretch"):
+            if st.button("🗑️ XÓA BILL", use_container_width=True):
                 st.session_state.cart = []
                 st.rerun()
 
@@ -569,7 +679,7 @@ if page == "🧾 Bán hàng":
 
 elif page == "🍽️ Quản lý món":
 
-    st.subheader("🍽️ QUẢN LÝ MENU MÓN ĂN")
+    st.subheader("🍽️️ QUẢN LÝ MENU MÓN ĂN")
 
     tab1, tab2 = st.tabs(["➕ Thêm món", "📋 Danh sách món"])
 
@@ -649,7 +759,7 @@ elif page == "🍽️ Quản lý món":
                         "unit": "Đơn vị"
                     }
                 ),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True
             )
 
@@ -679,7 +789,7 @@ elif page == "🍽️ Quản lý món":
                 if st.button(
                     "💾 LƯU THAY ĐỔI",
                     type="primary",
-                    width="stretch"
+                    use_container_width=True
                 ):
                     conn = connect_db()
                     conn.execute(
@@ -701,7 +811,7 @@ elif page == "🍽️ Quản lý món":
                     "⛔ NGỪNG BÁN" if selected["active"] else "✅ BÁN LẠI"
                 )
 
-                if st.button(text, width="stretch"):
+                if st.button(text, use_container_width=True):
                     new_status = 0 if selected["active"] else 1
                     conn = connect_db()
                     conn.execute(
@@ -779,7 +889,7 @@ elif page == "📜 Hóa đơn":
                     "created_at": "Thời gian"
                 }
             ),
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
 
@@ -845,6 +955,96 @@ elif page == "📊 Doanh thu":
 
         st.dataframe(
             daily[["Ngày", "Doanh thu"]],
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
+
+# =========================================================
+# 5. TRANG TRỢ LÝ AI TƯ VẤN THỰC ĐƠN & QUẢN LÝ
+# =========================================================
+
+elif page == "🤖 Trợ lý AI Tư vấn":
+
+    st.subheader("🤖 TRỢ LÝ AI TƯ VẤN MÓAN ĂN & QUẢN LÝ")
+    st.caption("Gợi ý menu phù hợp dựa trên số người, sở thích và ngân sách khách hàng")
+
+    # Form nhập nhanh thông tin gợi ý
+    with st.expander("⚡ GỢI Ý NHANH THEO YÊU CẦU CỦA KHÁCH HÀNG", expanded=True):
+        col_p, col_pref, col_btn = st.columns([1.5, 3, 1.5])
+        with col_p:
+            num_people = st.number_input("Số lượng khách (người):", min_value=1, value=4, step=1)
+        with col_pref:
+            preference = st.text_input("Sở thích / Ghi chú:", placeholder="Ví dụ: Thích đồ ăn mặn, có trẻ em, không ăn cay...")
+        with col_btn:
+            st.write("")
+            st.write("")
+            quick_submit = st.button("💡 Gợi ý combo ngay", type="primary", use_container_width=True)
+
+    col_model, col_clear = st.columns([4, 1])
+    with col_model:
+        model_choice = st.selectbox(
+            "Chọn Mô hình AI (OpenRouter):",
+            [
+                "google/gemini-2.5-flash",
+                "openai/gpt-4o-mini",
+                "anthropic/claude-3.5-haiku",
+                "deepseek/deepseek-chat"
+            ]
+        )
+    with col_clear:
+        st.write("")
+        st.write("")
+        if st.button("🗑️ Xóa Lịch Sử Chat", use_container_width=True):
+            st.session_state.ai_messages = [
+                {
+                    "role": "assistant",
+                    "content": "Đã làm sạch lịch sử hội thoại! Bạn có nhu cầu tư vấn món ăn nào khác không?"
+                }
+            ]
+            st.rerun()
+
+    st.divider()
+
+    # Hiển thị lịch sử trò chuyện
+    for msg in st.session_state.ai_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Xử lý khi bấm nút "Gợi ý combo ngay"
+    user_prompt = ""
+    if quick_submit:
+        user_prompt = f"Tôi có bàn {num_people} người. Yêu cầu/sở thích: {preference if preference.strip() else 'Ăn uống đa dạng, vừa đủ no'}. Hãy tư vấn cho tôi một combo món ăn hoàn chỉnh từ menu nhà hàng!"
+
+    # Nhận câu hỏi tự do từ chat_input
+    chat_prompt = st.chat_input("Hỏi AI bất kỳ điều gì (Ví dụ: Bàn 6 người ăn lẩu thì chọn thêm món gì?)...")
+    if chat_prompt:
+        user_prompt = chat_prompt
+
+    if user_prompt:
+        st.session_state.ai_messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        # Lấy danh sách Menu thực tế từ CSDL để gửi làm ngữ cảnh cho AI
+        db_summary = get_restaurant_summary_for_ai()
+        system_instruction = (
+            "Bạn là chuyên viên tư vấn ẩm thực xuất sắc của Nhà Hàng Cỏ BỐN LÁ. "
+            "Nhiệm vụ của bạn là dựa vào DANH SÁCH MENU ĐANG PHỤC VỤ bên dưới để tư vấn món ăn hợp lý nhất cho khách hàng.\n\n"
+            "QUY TẮC TƯ VẤN:\n"
+            "1. Chỉ gợi ý các món ăn CÓ TRONG DANH SÁCH MENU dưới đây.\n"
+            "2. Căn cứ vào số lượng người ăn để đề xuất số lượng món (món khai vị, món chính, lẩu/cơm, nước uống, tráng miệng) sao cho vừa đủ no, không bị thừa rác thực phẩm.\n"
+            "3. Liệt kê rõ ràng từng món, số lượng khuyến nghị, đơn giá và TỔNG CHI PHÍ DỰ KIẾN.\n"
+            "4. Giữ thái độ thân thiện, lịch sự, chu đáo.\n\n"
+            f"{db_summary}"
+        )
+
+        api_messages = [{"role": "system", "content": system_instruction}]
+        for m in st.session_state.ai_messages:
+            api_messages.append({"role": m["role"], "content": m["content"]})
+
+        with st.chat_message("assistant"):
+            with st.spinner("AI đang chọn lọc món ăn tối ưu nhất từ Menu..."):
+                response_text = call_openrouter(api_messages, model=model_choice)
+                st.markdown(response_text)
+
+        st.session_state.ai_messages.append({"role": "assistant", "content": response_text})
